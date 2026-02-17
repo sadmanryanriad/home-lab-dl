@@ -1,0 +1,5 @@
+python-telegram-bot==20.*
+yt-dlp
+python-dotenv
+aiohttp
+aiofiles

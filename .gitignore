@@ -1,0 +1,18 @@
+# Ignore Secrets
+.env
+.env.local
+
+# Ignore System Logs
+*.log
+*.tmp
+
+# Ignore OS junk
+.DS_Store
+Thumbs.db
+
+# Ignore SSH keys (just in case)
+id_rsa
+id_rsa.pub
+
+venv/
+__pycache__/
