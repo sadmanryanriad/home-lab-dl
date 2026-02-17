@@ -21,4 +21,4 @@ COPY . .
 RUN mkdir -p /app/downloads/temp /app/downloads/completed
 
 # Command to run the bot
-CMD ["python", "main.py"]
+CMD pip install --upgrade yt-dlp && python main.py
