@@ -105,6 +105,7 @@ TELEGRAM_CHAT_ID=123456789,987654321
 
    ```yaml
    services:
+     # Your existing downloader bot
      home-lab-dl:
        build: .
        container_name: home-lab-dl
@@ -115,6 +116,20 @@ TELEGRAM_CHAT_ID=123456789,987654321
          - /mnt/storage/downloads/completed:/app/downloads/completed
          - /mnt/storage/downloads/temp:/app/downloads/temp
          - /mnt/storage/downloads/autoload:/app/downloads/autoload
+
+     # The new File Manager UI (OvenDrop UI)
+     oven-drop-ui:
+       image: filebrowser/filebrowser:s6
+       container_name: filebrowser
+       user: "1000:1000"
+       # ❌ REMOVED: ports: - "8081:80" (Coolify handles this now)
+       volumes:
+         - /mnt/storage/downloads/home-lab-dl:/srv
+         - /home/riad/filebrowser/filebrowser.db:/database.db
+         - /home/riad/filebrowser/settings.json:/config/settings.json
+       environment:
+         - FB_BASEURL=/
+       restart: unless-stopped
    ```
 
 4. Build and start:
