@@ -1,5 +1,4 @@
 services:
-  # Your existing downloader bot
   home-lab-dl:
     build: .
     container_name: home-lab-dl
@@ -11,12 +10,12 @@ services:
       - /mnt/storage/downloads/temp:/app/downloads/temp
       - /mnt/storage/downloads/autoload:/app/downloads/autoload
 
-  # The new File Manager UI (OvenDrop UI)
   oven-drop-ui:
     image: filebrowser/filebrowser:s6
     container_name: filebrowser
     user: "1000:1000"
-    # ❌ REMOVED: ports: - "8081:80" (Coolify handles this now)
+    ports:
+      - "8081:80"  
     volumes:
       - /mnt/storage/downloads/home-lab-dl:/srv
       - /home/riad/filebrowser/filebrowser.db:/database.db
