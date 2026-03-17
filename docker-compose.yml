@@ -6,9 +6,7 @@ services:
     env_file:
       - .env
     volumes:
-      - /mnt/storage/downloads/completed:/app/downloads/completed
-      - /mnt/storage/downloads/temp:/app/downloads/temp
-      - /mnt/storage/downloads/autoload:/app/downloads/autoload
+      - /mnt/storage/downloads/home-lab-dl:/app/downloads
 
   oven-drop-ui:
     image: filebrowser/filebrowser:s6

@@ -19,7 +19,7 @@ COPY . .
 
 # Create the internal download directories
 # These will be mapped to your Host storage later
-RUN mkdir -p /app/downloads/temp /app/downloads/completed /app/downloads/autoload
+RUN mkdir -p /app/downloads/movies /app/downloads/shows
 
 # Command to run the bot
 CMD pip install --upgrade yt-dlp && python main.py

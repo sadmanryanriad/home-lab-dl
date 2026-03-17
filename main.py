@@ -28,9 +28,6 @@ AUTHORIZED_USERS: set[int] = {int(i.strip()) for i in _raw_ids if i.strip().isdi
 
 # Paths
 BASE_DIR = "downloads"
-DOWNLOAD_DIR = os.path.join(BASE_DIR, "completed")
-TEMP_DIR = os.path.join(BASE_DIR, "temp")
-AUTOLOAD_DIR = os.path.join(BASE_DIR, "autoload")
 
 # Timeouts
 AIOHTTP_TIMEOUT = None  # no global timeout — prevents premature kills on large metadata fetches
@@ -53,7 +50,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- STATE ---
-pending_links: dict[int, str] = {}       # user_id → url
+# pending_downloads: user_id → {"url": url, "category": cat}
+pending_downloads: dict[int, dict] = {}
 completed_files: dict[str, str] = {}     # timestamp_key → filepath
 
 
@@ -107,6 +105,16 @@ def is_video_site(url: str) -> bool:
 def is_torrent_or_magnet(url: str) -> bool:
     """Check if the URL is a .torrent link or a magnet URI."""
     return url.startswith("magnet:") or url.split("?")[0].lower().endswith(".torrent")
+
+
+def get_output_dir(category: str) -> str:
+    """Return the output directory path based on the chosen category."""
+    if category == "Movie":
+        return os.path.join(BASE_DIR, "movies")
+    elif category == "Show":
+        return os.path.join(BASE_DIR, "shows")
+    else:  # "Others" or fallback
+        return BASE_DIR
 
 
 # --- PROGRESS TRACKER ---
@@ -197,24 +205,20 @@ async def cleanup_temp(path: str):
 
 # --- TORRENT / MAGNET HANDLER ---
 async def handle_torrent(url: str, status_msg):
-    """Save a .torrent file or magnet link to the autoload directory.
-
-    qBittorrent's watched-folder picks it up automatically.
-    """
+    """Save a .torrent file or magnet link to the BASE_DIR."""
     if url.startswith("magnet:"):
-        # Write the magnet URI into a .magnet file that qBittorrent can watch
-        magnet_file = os.path.join(AUTOLOAD_DIR, f"magnet_{int(time.time())}.magnet")
+        # Write the magnet URI into a .magnet file
+        magnet_file = os.path.join(BASE_DIR, f"magnet_{int(time.time())}.magnet")
         with open(magnet_file, "w") as f:
             f.write(url)
         await status_msg.edit_text(
             "🧲 <b>Magnet link saved!</b>\n"
-            f"📂 <code>{os.path.basename(magnet_file)}</code>\n\n"
-            "qBittorrent will pick it up from the autoload folder.",
+            f"📂 <code>{os.path.basename(magnet_file)}</code>",
             parse_mode="HTML",
         )
         return magnet_file
 
-    # It's a .torrent URL — download the small file into autoload
+    # It's a .torrent URL — download the small file
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
@@ -224,13 +228,12 @@ async def handle_torrent(url: str, status_msg):
                 filename = get_filename_from_headers(resp.headers, url)
                 if not filename.lower().endswith(".torrent"):
                     filename += ".torrent"
-                torrent_path = os.path.join(AUTOLOAD_DIR, filename)
+                torrent_path = os.path.join(BASE_DIR, filename)
                 with open(torrent_path, "wb") as f:
                     f.write(await resp.read())
         await status_msg.edit_text(
             "📥 <b>Torrent file saved!</b>\n"
-            f"📂 <code>{filename}</code>\n\n"
-            "qBittorrent will pick it up from the autoload folder.",
+            f"📂 <code>{filename}</code>",
             parse_mode="HTML",
         )
         return torrent_path
@@ -240,7 +243,7 @@ async def handle_torrent(url: str, status_msg):
 
 
 # --- DIRECT FILE DOWNLOADER (aria2c) ---
-async def download_direct(url: str, status_msg, loop):
+async def download_direct(url: str, status_msg, loop, category: str = "Others"):
     """Download a direct HTTP file using aria2c with progress tracking."""
     # Resolve the real filename via a HEAD request
     filename = f"download_{int(time.time())}.bin"
@@ -254,15 +257,14 @@ async def download_direct(url: str, status_msg, loop):
     tracker = ProgressTracker(status_msg, loop)
     tracker.filename = filename
 
-    temp_dir_abs = os.path.abspath(TEMP_DIR)
-    final_dir_abs = os.path.abspath(DOWNLOAD_DIR)
-    temp_path = os.path.join(temp_dir_abs, filename)
-    final_path = os.path.join(final_dir_abs, filename)
+    out_dir_abs = os.path.abspath(get_output_dir(category))
+    os.makedirs(out_dir_abs, exist_ok=True)
+    final_path = os.path.join(out_dir_abs, filename)
 
     cmd = [
         "aria2c",
         url,
-        f"--dir={temp_dir_abs}",
+        f"--dir={out_dir_abs}",
         f"--out={filename}",
         "--max-connection-per-server=5",
         "--continue=true",
@@ -292,19 +294,21 @@ async def download_direct(url: str, status_msg, loop):
     returncode = await process.wait()
 
     if returncode != 0:
-        await cleanup_temp(temp_path)
+        await cleanup_temp(final_path)
+        await cleanup_temp(final_path + ".aria2")
         raise RuntimeError(f"aria2c exited with code {returncode}")
 
-    # Move from temp to completed
-    shutil.move(temp_path, final_path)
     return final_path
 
 
 # --- YT-DLP DOWNLOADER ---
-def _build_ydl_opts(fmt: str, tracker: ProgressTracker) -> dict:
+def _build_ydl_opts(fmt: str, tracker: ProgressTracker, category: str) -> dict:
     """Build yt-dlp options for the given format choice."""
+    out_dir = get_output_dir(category)
+    os.makedirs(out_dir, exist_ok=True)
+    
     opts: dict = {
-        "outtmpl": f"{DOWNLOAD_DIR}/%(title).80s.%(ext)s",
+        "outtmpl": f"{out_dir}/%(title).80s.%(ext)s",
         "progress_hooks": [tracker.yt_dlp_hook],
         "quiet": True,
         "noplaylist": True,
@@ -332,10 +336,10 @@ def _build_ydl_opts(fmt: str, tracker: ProgressTracker) -> dict:
     return opts
 
 
-async def download_video(url: str, fmt: str, status_msg, loop) -> str | None:
+async def download_video(url: str, fmt: str, status_msg, loop, category: str) -> str | None:
     """Download a video/audio via yt-dlp; returns the final filepath or None."""
     tracker = ProgressTracker(status_msg, loop)
-    opts = _build_ydl_opts(fmt, tracker)
+    opts = _build_ydl_opts(fmt, tracker, category)
 
     def run():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -353,6 +357,21 @@ async def download_video(url: str, fmt: str, status_msg, loop) -> str | None:
 
 
 # --- INLINE KEYBOARD ---
+def category_keyboard() -> InlineKeyboardMarkup:
+    """Build the category selection inline keyboard."""
+    buttons = [
+        [
+            InlineKeyboardButton("🎬 Movie", callback_data="cat_Movie"),
+            InlineKeyboardButton("📺 Show", callback_data="cat_Show"),
+        ],
+        [
+            InlineKeyboardButton("📱 Others", callback_data="cat_Others"),
+            InlineKeyboardButton("❌ Dismiss", callback_data="dismiss"),
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 def format_keyboard() -> InlineKeyboardMarkup:
     """Build the format selection inline keyboard."""
     buttons = [
@@ -361,8 +380,8 @@ def format_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📱 1080p", callback_data="fmt_1080p"),
         ],
         [
-            InlineKeyboardButton("🎧 Audio MP3", callback_data="fmt_audio"),
-            InlineKeyboardButton("❌ Cancel", callback_data="fmt_cancel"),
+            InlineKeyboardButton("🎧 Audio", callback_data="fmt_audio"),
+            InlineKeyboardButton("❌ Dismiss", callback_data="dismiss"),
         ],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -381,8 +400,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _handle_successful_download(filepath: str, status_msg):
+    if filepath and os.path.exists(filepath):
+        filename = os.path.basename(filepath)
+        ts_key = str(int(time.time()))
+        completed_files[ts_key] = filepath
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        await status_msg.edit_text(
+            f"✅ <b>Saved:</b> <code>{filename}</code>\n"
+            f"💾 Size: {size_mb:.1f} MB\n\n"
+            f"📤 Upload to chat: /get_{ts_key}",
+            parse_mode="HTML",
+        )
+    else:
+        await status_msg.edit_text("❌ Download failed — file not found.")
+
+
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive a URL and route it: torrent → autoload, video → keyboard, direct → aria2."""
+    """Receive a URL and route it."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
@@ -394,46 +429,34 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please send a valid link or magnet URI.")
         return
 
-    # --- Route 1: Torrent / Magnet → qBittorrent autoload ---
+    # --- Route 1: Torrent / Magnet ---
     if is_torrent_or_magnet(url):
         status_msg = await update.message.reply_text("🧲 Processing torrent…")
         await handle_torrent(url, status_msg)
         return
 
-    # --- Route 2: Video site → show format keyboard ---
-    if is_video_site(url):
-        pending_links[user_id] = url
+    # --- Route 2: Video or Direct Link → Category/Format Selection ---
+    is_social = any(s in url for s in ["tiktok.com", "instagram.com", "facebook.com", "fb.watch", "twitter.com", "x.com"])
+    
+    if is_social:
+        # Smart routing: Skip category selection
+        pending_downloads[user_id] = {"url": url, "category": "Others"}
         await update.message.reply_text(
-            f"🔗 <b>Link received!</b>\n<code>{url[:80]}</code>\n\nChoose format:",
+            f"🔗 <b>Social link detected!</b>\n<code>{url[:80]}</code>\n\nChoose format:",
             parse_mode="HTML",
             reply_markup=format_keyboard(),
         )
-        return
-
-    # --- Route 3: Direct link → download immediately with aria2 ---
-    status_msg = await update.message.reply_text("⏳ Starting direct download…")
-    loop = asyncio.get_running_loop()
-    try:
-        filepath = await download_direct(url, status_msg, loop)
-        if filepath and os.path.exists(filepath):
-            filename = os.path.basename(filepath)
-            ts_key = str(int(time.time()))
-            completed_files[ts_key] = filepath
-            size_mb = os.path.getsize(filepath) / 1024 / 1024
-            await status_msg.edit_text(
-                f"✅ <b>Saved:</b> <code>{filename}</code>\n"
-                f"💾 Size: {size_mb:.1f} MB\n\n"
-                f"📤 Upload to chat: /get_{ts_key}",
-                parse_mode="HTML",
-            )
-        else:
-            await status_msg.edit_text("❌ Download failed — file not found.")
-    except Exception as e:
-        logger.error("Direct download error: %s", e, exc_info=True)
-        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+    else:
+        # General link (video site or direct download)
+        pending_downloads[user_id] = {"url": url, "category": None}
+        await update.message.reply_text(
+            f"🔗 <b>Link received!</b>\n<code>{url[:80]}</code>\n\n📂 Select Category:",
+            parse_mode="HTML",
+            reply_markup=category_keyboard(),
+        )
 
 
-async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button presses."""
     query = update.callback_query
     await query.answer()
@@ -442,51 +465,61 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_authorized(user_id):
         return
 
-    choice = query.data  # fmt_best / fmt_1080p / fmt_audio / fmt_cancel
-    url = pending_links.pop(user_id, None)
+    data = query.data
 
-    if choice == "fmt_cancel":
-        await query.edit_message_text("❌ Cancelled.")
+    if data == "dismiss":
+        await query.message.delete()
+        pending_downloads.pop(user_id, None)
         return
 
-    if not url:
+    state = pending_downloads.get(user_id)
+    if not state:
         await query.edit_message_text("⚠️ No pending link. Send a new one.")
         return
 
-    fmt = choice.replace("fmt_", "")  # best / 1080p / audio
-    labels = {"best": "🎬 Best Video", "1080p": "📱 1080p", "audio": "🎧 Audio MP3"}
-    status_msg = await query.edit_message_text(
-        f"⏳ Starting download… ({labels.get(fmt, fmt)})"
-    )
-
+    url = state.get("url")
     loop = asyncio.get_running_loop()
-    filepath = None
 
-    try:
-        if is_video_site(url):
-            filepath = await download_video(url, fmt, status_msg, loop)
-        else:
-            # Direct download (format choice doesn't apply, just grab the file)
-            filepath = await download_direct(url, status_msg, loop)
+    if data.startswith("cat_"):
+        cat = data.split("_")[1]
+        pending_downloads[user_id]["category"] = cat
+        
+        # If it's not a video site, skip format selection and start aria2 download
+        if not is_video_site(url):
+            pending_downloads.pop(user_id, None)
+            status_msg = await query.edit_message_text(f"⏳ Starting direct download in {cat}…")
+            try:
+                filepath = await download_direct(url, status_msg, loop, category=cat)
+                await _handle_successful_download(filepath, status_msg)
+            except Exception as e:
+                logger.error("Direct download error: %s", e, exc_info=True)
+                await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+            return
 
-        if filepath and os.path.exists(filepath):
-            filename = os.path.basename(filepath)
-            ts_key = str(int(time.time()))
-            completed_files[ts_key] = filepath
-            size_mb = os.path.getsize(filepath) / 1024 / 1024
+        # It's a video site, ask for format
+        await query.edit_message_text(
+            f"🔗 <b>Category:</b> {cat}\n<code>{url[:80]}</code>\n\nChoose format:",
+            parse_mode="HTML",
+            reply_markup=format_keyboard(),
+        )
+        return
 
-            await status_msg.edit_text(
-                f"✅ <b>Saved:</b> <code>{filename}</code>\n"
-                f"💾 Size: {size_mb:.1f} MB\n\n"
-                f"📤 Upload to chat: /get_{ts_key}",
-                parse_mode="HTML",
-            )
-        else:
-            await status_msg.edit_text("❌ Download failed — file not found.")
+    if data.startswith("fmt_"):
+        fmt = data.replace("fmt_", "")
+        cat = state.get("category", "Others")
+        pending_downloads.pop(user_id, None)
 
-    except Exception as e:
-        logger.error("Download error: %s", e, exc_info=True)
-        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+        labels = {"best": "🎬 Best Video", "1080p": "📱 1080p", "audio": "🎧 Audio"}
+        status_msg = await query.edit_message_text(
+            f"⏳ Starting download… ({labels.get(fmt, fmt)} -> {cat})"
+        )
+
+        try:
+            filepath = await download_video(url, fmt, status_msg, loop, category=cat)
+            await _handle_successful_download(filepath, status_msg)
+        except Exception as e:
+            logger.error("Download error: %s", e, exc_info=True)
+            await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
 
 async def handle_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -538,9 +571,7 @@ async def handle_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    os.makedirs(AUTOLOAD_DIR, exist_ok=True)
+    os.makedirs(BASE_DIR, exist_ok=True)
 
     if not TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN not set!")
@@ -552,7 +583,7 @@ if __name__ == "__main__":
 
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(handle_format_choice))
+    app.add_handler(CallbackQueryHandler(handle_inline_buttons))
     app.add_handler(
         MessageHandler(filters.Regex(r"^/get_\d+"), handle_get_file)
     )
