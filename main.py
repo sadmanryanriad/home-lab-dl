@@ -102,9 +102,6 @@ def is_video_site(url: str) -> bool:
     return any(s in url for s in sites)
 
 
-def is_torrent_or_magnet(url: str) -> bool:
-    """Check if the URL is a .torrent link or a magnet URI."""
-    return url.startswith("magnet:") or url.split("?")[0].lower().endswith(".torrent")
 
 
 def get_output_dir(category: str) -> str:
@@ -203,56 +200,21 @@ async def cleanup_temp(path: str):
         pass
 
 
-# --- TORRENT / MAGNET HANDLER ---
-async def handle_torrent(url: str, status_msg):
-    """Save a .torrent file or magnet link to the BASE_DIR."""
-    if url.startswith("magnet:"):
-        # Write the magnet URI into a .magnet file
-        magnet_file = os.path.join(BASE_DIR, f"magnet_{int(time.time())}.magnet")
-        with open(magnet_file, "w") as f:
-            f.write(url)
-        await status_msg.edit_text(
-            "🧲 <b>Magnet link saved!</b>\n"
-            f"📂 <code>{os.path.basename(magnet_file)}</code>",
-            parse_mode="HTML",
-        )
-        return magnet_file
-
-    # It's a .torrent URL — download the small file
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    await status_msg.edit_text(f"❌ Failed to fetch .torrent (HTTP {resp.status})")
-                    return None
-                filename = get_filename_from_headers(resp.headers, url)
-                if not filename.lower().endswith(".torrent"):
-                    filename += ".torrent"
-                torrent_path = os.path.join(BASE_DIR, filename)
-                with open(torrent_path, "wb") as f:
-                    f.write(await resp.read())
-        await status_msg.edit_text(
-            "📥 <b>Torrent file saved!</b>\n"
-            f"📂 <code>{filename}</code>",
-            parse_mode="HTML",
-        )
-        return torrent_path
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Failed to save torrent: {str(e)[:200]}")
-        return None
-
-
 # --- DIRECT FILE DOWNLOADER (aria2c) ---
 async def download_direct(url: str, status_msg, loop, category: str = "Others"):
     """Download a direct HTTP file using aria2c with progress tracking."""
-    # Resolve the real filename via a HEAD request
+    # Resolve the real filename via a HEAD request if it's a URL
     filename = f"download_{int(time.time())}.bin"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head(url, allow_redirects=True) as resp:
-                filename = get_filename_from_headers(resp.headers, url)
-    except Exception:
-        pass  # fall back to the timestamped name
+    if url.startswith("http"):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.head(url, allow_redirects=True) as resp:
+                    filename = get_filename_from_headers(resp.headers, url)
+        except Exception:
+            pass  # fall back to the timestamped name
+    else:
+        # local file or magnet
+        filename = sanitize_filename(os.path.basename(url))
 
     tracker = ProgressTracker(status_msg, loop)
     tracker.filename = filename
@@ -271,6 +233,7 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
         "--summary-interval=1",
         "--console-log-level=notice",
         "--download-result=hide",
+        "--seed-time=0",
         f"--user-agent={USER_AGENT}",
     ]
 
@@ -280,6 +243,7 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
         stderr=asyncio.subprocess.STDOUT,
     )
 
+    downloaded_paths = []
     # Stream aria2c output and feed progress tracker
     while True:
         line = await process.stdout.readline()
@@ -290,13 +254,32 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
             logger.info("aria2c: %s", decoded)
             if "%" in decoded:
                 await tracker.update_from_aria2_line(decoded)
+            match = re.search(r"Download complete: (.*)", decoded)
+            if match:
+                downloaded_paths.append(match.group(1).strip())
 
     returncode = await process.wait()
+
+    if downloaded_paths:
+        final_path = downloaded_paths[-1]
 
     if returncode != 0:
         await cleanup_temp(final_path)
         await cleanup_temp(final_path + ".aria2")
         raise RuntimeError(f"aria2c exited with code {returncode}")
+
+    # Remove the local .torrent temp file if we used one
+    if not url.startswith("http") and not url.startswith("magnet:") and os.path.exists(url):
+        await cleanup_temp(url)
+
+    # Remove leftover .torrent/.aria2 files in the dir
+    try:
+        if os.path.exists(out_dir_abs):
+            for f in os.listdir(out_dir_abs):
+                if f.endswith(".torrent") or f.endswith(".aria2"):
+                    os.remove(os.path.join(out_dir_abs, f))
+    except Exception as e:
+        logger.error("Cleanup error: %s", e)
 
     return final_path
 
@@ -429,11 +412,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please send a valid link or magnet URI.")
         return
 
-    # --- Route 1: Torrent / Magnet ---
-    if is_torrent_or_magnet(url):
-        status_msg = await update.message.reply_text("🧲 Processing torrent…")
-        await handle_torrent(url, status_msg)
-        return
 
     # --- Route 2: Video or Direct Link → Category/Format Selection ---
     is_social = any(s in url for s in ["tiktok.com", "instagram.com", "facebook.com", "fb.watch", "twitter.com", "x.com"])
@@ -569,6 +547,33 @@ async def handle_get_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Upload failed: {str(e)[:150]}")
 
 
+async def handle_torrent_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive a .torrent file upload and route it."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(".torrent"):
+        await update.message.reply_text("⚠️ Please send a valid .torrent file.")
+        return
+
+    status_msg = await update.message.reply_text("📥 Receiving .torrent file…")
+    file = await context.bot.get_file(doc.file_id)
+    
+    os.makedirs(os.path.join(BASE_DIR, "temp"), exist_ok=True)
+    temp_path = os.path.join(BASE_DIR, "temp", sanitize_filename(doc.file_name))
+    await file.download_to_drive(temp_path)
+    
+    # Route to category
+    pending_downloads[user_id] = {"url": temp_path, "category": None}
+    await status_msg.edit_text(
+        f"🔗 <b>Torrent File Received!</b>\n<code>{doc.file_name}</code>\n\n📂 Select Category:",
+        parse_mode="HTML",
+        reply_markup=category_keyboard(),
+    )
+
+
 # --- MAIN ---
 if __name__ == "__main__":
     os.makedirs(BASE_DIR, exist_ok=True)
@@ -586,6 +591,9 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_inline_buttons))
     app.add_handler(
         MessageHandler(filters.Regex(r"^/get_\d+"), handle_get_file)
+    )
+    app.add_handler(
+        MessageHandler(filters.Document.FileExtension("torrent"), handle_torrent_document)
     )
     app.add_handler(
         MessageHandler(filters.TEXT & (~filters.COMMAND), handle_link)

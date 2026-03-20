@@ -1,7 +1,7 @@
 # 📥 Home-Lab-DL
 
 > **A Headless, Dockerized Telegram Bot for your Home Server.**
-> Send links from anywhere; files appear on your server. Powered by `yt-dlp`, `aria2`, and qBittorrent integration.
+> Send links from anywhere; files appear on your server. Powered by `yt-dlp` and `aria2`.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)
@@ -12,7 +12,7 @@
 ## 🚀 Features
 
 - **Intelligent Link Routing** — The bot auto-detects link type and takes the right action:
-  - 🧲 **Torrent / Magnet** — Saved to the autoload folder for qBittorrent to pick up.
+  - 🧲 **Torrent / Magnet** — Downloaded directly using `aria2c` with zero-seeding, categorised correctly, and with auto-cleanup of residuals.
   - 🎥 **Video Sites** — Shows an inline keyboard for quality selection (Best / 1080p / Audio).
   - 📥 **Direct Links** — Downloaded immediately via `aria2c` with multi-connection acceleration.
 - **Interactive Format Menu** — For video sites, choose quality via inline buttons:
@@ -49,9 +49,9 @@ home-lab-dl/
 ├── .env                # Environment variables (not committed)
 ├── .gitignore          # Git ignore rules
 └── downloads/
-    ├── completed/      # Finished downloads (mapped to HDD)
-    ├── temp/           # In-progress downloads
-    └── autoload/       # .torrent / .magnet files for qBittorrent
+    ├── movies/         # Downloaded movies
+    ├── shows/          # Downloaded TV shows
+    └── temp/           # Temporary files
 ```
 
 ---
@@ -113,9 +113,7 @@ TELEGRAM_CHAT_ID=123456789,987654321
        env_file:
          - .env
        volumes:
-         - /mnt/storage/downloads/completed:/app/downloads/completed
-         - /mnt/storage/downloads/temp:/app/downloads/temp
-         - /mnt/storage/downloads/autoload:/app/downloads/autoload
+         - /mnt/storage/downloads/home-lab-dl:/app/downloads
 
      # The new File Manager UI (OvenDrop UI)
      oven-drop-ui:
@@ -208,7 +206,7 @@ TELEGRAM_CHAT_ID=123456789,987654321
 
 ### Supported Sites
 
-YouTube, TikTok, Facebook, Instagram, Twitter/X, Reddit, Vimeo, Dailymotion, and [1000+ sites supported by yt-dlp](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). Any direct HTTP/HTTPS file link also works. `.torrent` files and `magnet:` URIs are routed to qBittorrent.
+YouTube, TikTok, Facebook, Instagram, Twitter/X, Reddit, Vimeo, Dailymotion, and [1000+ sites supported by yt-dlp](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md). Any direct HTTP/HTTPS file link also works. `.torrent` files and `magnet:` URIs are directly downloaded by `aria2c`.
 
 ---
 
@@ -232,14 +230,6 @@ YouTube, TikTok, Facebook, Instagram, Twitter/X, Reddit, Vimeo, Dailymotion, and
 | `aria2` (system)           | Multi-connection direct file downloader            |
 
 ## 🔧 Troubleshooting
-
-### Torrent files aren't being picked up by qBittorrent
-
-The bot saves `.torrent` files and `.magnet` URIs to the `/app/downloads/autoload` directory (mapped to `/mnt/storage/downloads/autoload` on the host). For qBittorrent to automatically start these downloads:
-
-1. Open qBittorrent Web UI → **Options** → **Downloads**.
-2. Enable **"Automatically add torrents from"** and point it to `/mnt/storage/downloads/autoload`.
-3. (Optional) Enable **"Delete .torrent files afterwards"** to keep the folder clean.
 
 ### aria2 download fails with "connection refused"
 
