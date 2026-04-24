@@ -131,7 +131,7 @@ class ProgressTracker:
         
         active_downloads[cancel_id] = self
 
-    async def update(self, current: int, total: int):
+    async def update(self, current: int, total: int, speed: float = None, eta: int = None):
         now = time.time()
         if (now - self.last_update_time < 3) and (current != total):
             return
@@ -141,10 +141,25 @@ class ProgressTracker:
         bar = "■" * filled + "□" * (bar_len - filled)
         cur_mb = current / 1024 / 1024
         tot_mb = total / 1024 / 1024
+        
+        speed_str = "?"
+        if speed is not None:
+            if speed > 1024 * 1024:
+                speed_str = f"{speed / 1024 / 1024:.1f}MiB/s"
+            else:
+                speed_str = f"{speed / 1024:.1f}KiB/s"
+        
+        eta_str = "?"
+        if eta is not None:
+            if eta > 60:
+                eta_str = f"{int(eta) // 60}m{int(eta) % 60}s"
+            else:
+                eta_str = f"{int(eta)}s"
+
         text = (
             f"📥 <b>Downloading:</b> {self.filename}\n"
             f"<code>[{bar}] {percent:.1f}%</code>\n"
-            f"💾 {cur_mb:.1f}MB / {tot_mb:.1f}MB"
+            f"💾 {cur_mb:.1f}MB / {tot_mb:.1f}MB  ⚡ {speed_str}  ⏳ {eta_str}"
         )
         self.last_update_time = now
         try:
@@ -203,9 +218,11 @@ class ProgressTracker:
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes")
+            speed = d.get("speed")
+            eta = d.get("eta")
             if total and downloaded:
                 asyncio.run_coroutine_threadsafe(
-                    self.update(downloaded, total), self.loop
+                    self.update(downloaded, total, speed, eta), self.loop
                 )
 
 
