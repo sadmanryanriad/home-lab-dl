@@ -166,10 +166,12 @@ class ProgressTracker:
         percent_match = re.search(r"(\d+)%", line)
         speed_match = re.search(r"DL:(\S+)", line)
         eta_match = re.search(r"ETA:(\S+)", line)
+        size_match = re.search(r"([\d\.]+[A-Za-z]+/([\d\.]+[A-Za-z]+))", line)
 
         percent = percent_match.group(1) if percent_match else "?"
         speed = speed_match.group(1) if speed_match else "?"
         eta = eta_match.group(1) if eta_match else "?"
+        size_str = size_match.group(1) if size_match else "?/?"
 
         bar_len = 10
         try:
@@ -182,7 +184,7 @@ class ProgressTracker:
         text = (
             f"📥 <b>Downloading:</b> {self.filename}\n"
             f"<code>[{bar}] {percent}%</code>\n"
-            f"⚡ Speed: {speed}  ⏳ ETA: {eta}"
+            f"💾 {size_str}  ⚡ {speed}  ⏳ {eta}"
         )
         try:
             if not self.is_cancelled:
@@ -315,6 +317,7 @@ def _build_ydl_opts(fmt: str, tracker: ProgressTracker, category: str) -> dict:
     
     opts: dict = {
         "outtmpl": f"{out_dir}/%(title).80s.%(ext)s",
+        "source_address": "0.0.0.0",
         "progress_hooks": [tracker.yt_dlp_hook],
         "quiet": True,
         "noplaylist": True,
