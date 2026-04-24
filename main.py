@@ -164,9 +164,13 @@ class ProgressTracker:
             return
 
         percent_match = re.search(r"(\d+)%", line)
-        speed_match = re.search(r"DL:(\S+)", line)
-        eta_match = re.search(r"ETA:(\S+)", line)
-        size_match = re.search(r"([\d\.]+[A-Za-z]+/([\d\.]+[A-Za-z]+))", line)
+        speed_match = re.search(r"DL:([^\s\]]+)", line)
+        eta_match = re.search(r"ETA:([^\s\]]+)", line)
+        size_match = re.search(r"([\d\.]+[A-Za-z]+/[\d\.]+[A-Za-z]+)", line)
+        
+        if not size_match:
+            # For indeterminate sizes like 1.2MiB
+            size_match = re.search(r"([\d\.]+[A-Za-z]+)", line.split("CN:")[0] if "CN:" in line else line)
 
         percent = percent_match.group(1) if percent_match else "?"
         speed = speed_match.group(1) if speed_match else "?"
@@ -177,9 +181,9 @@ class ProgressTracker:
         try:
             pct_int = int(percent)
             filled = bar_len * pct_int // 100
+            bar = "■" * filled + "□" * (bar_len - filled)
         except (ValueError, TypeError):
-            filled = 0
-        bar = "■" * filled + "□" * (bar_len - filled)
+            bar = "■■■■■□□□□□"  # Indeterminate
 
         text = (
             f"📥 <b>Downloading:</b> {self.filename}\n"
@@ -218,33 +222,21 @@ async def cleanup_temp(path: str):
 # --- DIRECT FILE DOWNLOADER (aria2c) ---
 async def download_direct(url: str, status_msg, loop, cancel_id: str, category: str = "Others"):
     """Download a direct HTTP file using aria2c with progress tracking."""
-    # Resolve the real filename via a HEAD request if it's a URL
-    filename = f"download_{int(time.time())}.bin"
-    if url.startswith("http"):
-        try:
-            # Enforce a 3-second timeout to prevent target servers from infinitely hanging the HEAD request
-            timeout = aiohttp.ClientTimeout(total=4)
-            async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout) as session:
-                async with session.head(url, allow_redirects=True) as resp:
-                    filename = get_filename_from_headers(resp.headers, url)
-        except Exception:
-            pass  # fall back to the timestamped name
-    else:
-        # local file or magnet
-        filename = sanitize_filename(os.path.basename(url))
-
     tracker = ProgressTracker(status_msg, loop, cancel_id)
-    tracker.filename = filename
+    
+    if not url.startswith("http") and not url.startswith("magnet:"):
+        tracker.filename = sanitize_filename(os.path.basename(url))
+    else:
+        tracker.filename = "Fetching details..."
 
     out_dir_abs = os.path.abspath(get_output_dir(category))
     os.makedirs(out_dir_abs, exist_ok=True)
-    final_path = os.path.join(out_dir_abs, filename)
+    final_path = None
 
     cmd = [
         "aria2c",
         url,
         f"--dir={out_dir_abs}",
-        f"--out={filename}",
         "--max-connection-per-server=5",
         "--split=10",
         "--min-split-size=1M",
@@ -255,6 +247,7 @@ async def download_direct(url: str, status_msg, loop, cancel_id: str, category: 
         "--console-log-level=notice",
         "--download-result=hide",
         "--seed-time=0",
+        "--content-disposition-default-utf8=true",
         f"--user-agent={USER_AGENT}",
     ]
 
@@ -274,7 +267,9 @@ async def download_direct(url: str, status_msg, loop, cancel_id: str, category: 
         decoded = line.decode("utf-8", errors="replace").strip()
         if decoded:
             logger.info("aria2c: %s", decoded)
-            if "%" in decoded:
+            if "FILE: " in decoded:
+                tracker.filename = os.path.basename(decoded.split("FILE: ")[1].strip())
+            if decoded.startswith("[#"):
                 await tracker.update_from_aria2_line(decoded)
             match = re.search(r"Download complete: (.*)", decoded)
             if match:
@@ -286,14 +281,19 @@ async def download_direct(url: str, status_msg, loop, cancel_id: str, category: 
     if downloaded_paths:
         final_path = downloaded_paths[-1]
 
+    if final_path is None and tracker.filename != "Fetching details...":
+        final_path = os.path.join(out_dir_abs, tracker.filename)
+
     if tracker.is_cancelled:
-        await cleanup_temp(final_path)
-        await cleanup_temp(final_path + ".aria2")
+        if final_path:
+            await cleanup_temp(final_path)
+            await cleanup_temp(final_path + ".aria2")
         return None
 
     if returncode != 0:
-        await cleanup_temp(final_path)
-        await cleanup_temp(final_path + ".aria2")
+        if final_path:
+            await cleanup_temp(final_path)
+            await cleanup_temp(final_path + ".aria2")
         raise RuntimeError(f"aria2c exited with code {returncode}")
 
     # Remove the local .torrent temp file if we used one
