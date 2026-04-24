@@ -146,10 +146,10 @@ class ProgressTracker:
             f"<code>[{bar}] {percent:.1f}%</code>\n"
             f"💾 {cur_mb:.1f}MB / {tot_mb:.1f}MB"
         )
+        self.last_update_time = now
         try:
             if not self.is_cancelled:
                 await self.status_message.edit_text(text, parse_mode="HTML", reply_markup=cancel_keyboard(self.cancel_id))
-            self.last_update_time = now
         except Exception:
             pass
 
@@ -186,10 +186,10 @@ class ProgressTracker:
             f"<code>[{bar}] {percent}%</code>\n"
             f"💾 {size_str}  ⚡ {speed}  ⏳ {eta}"
         )
+        self.last_update_time = now
         try:
             if not self.is_cancelled:
                 await self.status_message.edit_text(text, parse_mode="HTML", reply_markup=cancel_keyboard(self.cancel_id))
-            self.last_update_time = now
         except Exception:
             pass
 
