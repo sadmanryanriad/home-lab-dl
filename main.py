@@ -207,7 +207,7 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
     filename = f"download_{int(time.time())}.bin"
     if url.startswith("http"):
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
                 async with session.head(url, allow_redirects=True) as resp:
                     filename = get_filename_from_headers(resp.headers, url)
         except Exception:
@@ -229,6 +229,9 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
         f"--dir={out_dir_abs}",
         f"--out={filename}",
         "--max-connection-per-server=5",
+        "--split=10",
+        "--min-split-size=1M",
+        "--max-concurrent-downloads=5",
         "--continue=true",
         "--summary-interval=1",
         "--console-log-level=notice",
@@ -298,6 +301,9 @@ def _build_ydl_opts(fmt: str, tracker: ProgressTracker, category: str) -> dict:
         "restrictfilenames": True,
         "socket_timeout": YT_DLP_SOCKET_TIMEOUT,
         "http_headers": {"User-Agent": USER_AGENT},
+        "concurrent_fragment_downloads": 5,
+        "retries": 3,
+        "fragment_retries": 3,
     }
 
     if fmt == "audio":
@@ -326,9 +332,12 @@ async def download_video(url: str, fmt: str, status_msg, loop, category: str) ->
 
     def run():
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            # Setting 'download=True' downloads it in one go instead of fetching info then passing to download() again
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise Exception("Failed to extract video info")
+            
             tracker.filename = info.get("title", "Video")
-            ydl.download([url])
             # Determine the actual output path
             prepared = ydl.prepare_filename(info)
             if fmt == "audio":
