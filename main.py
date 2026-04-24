@@ -222,7 +222,9 @@ async def download_direct(url: str, status_msg, loop, cancel_id: str, category: 
     filename = f"download_{int(time.time())}.bin"
     if url.startswith("http"):
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
+            # Enforce a 3-second timeout to prevent target servers from infinitely hanging the HEAD request
+            timeout = aiohttp.ClientTimeout(total=4)
+            async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout) as session:
                 async with session.head(url, allow_redirects=True) as resp:
                     filename = get_filename_from_headers(resp.headers, url)
         except Exception:
@@ -247,6 +249,7 @@ async def download_direct(url: str, status_msg, loop, cancel_id: str, category: 
         "--split=10",
         "--min-split-size=1M",
         "--max-concurrent-downloads=5",
+        "--file-allocation=none",
         "--continue=true",
         "--summary-interval=1",
         "--console-log-level=notice",
