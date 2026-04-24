@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # pending_downloads: user_id → {"url": url, "category": cat}
 pending_downloads: dict[int, dict] = {}
 completed_files: dict[str, str] = {}     # timestamp_key → filepath
+active_downloads: dict[str, 'ProgressTracker'] = {} # cancel_id -> tracker
 
 
 # --- UTILS ---
@@ -115,12 +116,20 @@ def get_output_dir(category: str) -> str:
 
 
 # --- PROGRESS TRACKER ---
+def cancel_keyboard(cancel_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{cancel_id}")]])
+
 class ProgressTracker:
-    def __init__(self, status_message, loop):
+    def __init__(self, status_message, loop, cancel_id: str):
         self.status_message = status_message
         self.last_update_time = 0.0
         self.loop = loop
         self.filename = "Unknown"
+        self.cancel_id = cancel_id
+        self.is_cancelled = False
+        self.aria2_process = None
+        
+        active_downloads[cancel_id] = self
 
     async def update(self, current: int, total: int):
         now = time.time()
@@ -138,7 +147,8 @@ class ProgressTracker:
             f"💾 {cur_mb:.1f}MB / {tot_mb:.1f}MB"
         )
         try:
-            await self.status_message.edit_text(text, parse_mode="HTML")
+            if not self.is_cancelled:
+                await self.status_message.edit_text(text, parse_mode="HTML", reply_markup=cancel_keyboard(self.cancel_id))
             self.last_update_time = now
         except Exception:
             pass
@@ -175,12 +185,15 @@ class ProgressTracker:
             f"⚡ Speed: {speed}  ⏳ ETA: {eta}"
         )
         try:
-            await self.status_message.edit_text(text, parse_mode="HTML")
+            if not self.is_cancelled:
+                await self.status_message.edit_text(text, parse_mode="HTML", reply_markup=cancel_keyboard(self.cancel_id))
             self.last_update_time = now
         except Exception:
             pass
 
     def yt_dlp_hook(self, d: dict):
+        if self.is_cancelled:
+            raise ValueError("Cancelled by user")
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes")
@@ -201,7 +214,7 @@ async def cleanup_temp(path: str):
 
 
 # --- DIRECT FILE DOWNLOADER (aria2c) ---
-async def download_direct(url: str, status_msg, loop, category: str = "Others"):
+async def download_direct(url: str, status_msg, loop, cancel_id: str, category: str = "Others"):
     """Download a direct HTTP file using aria2c with progress tracking."""
     # Resolve the real filename via a HEAD request if it's a URL
     filename = f"download_{int(time.time())}.bin"
@@ -216,7 +229,7 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
         # local file or magnet
         filename = sanitize_filename(os.path.basename(url))
 
-    tracker = ProgressTracker(status_msg, loop)
+    tracker = ProgressTracker(status_msg, loop, cancel_id)
     tracker.filename = filename
 
     out_dir_abs = os.path.abspath(get_output_dir(category))
@@ -245,6 +258,7 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
+    tracker.aria2_process = process
 
     downloaded_paths = []
     # Stream aria2c output and feed progress tracker
@@ -262,9 +276,15 @@ async def download_direct(url: str, status_msg, loop, category: str = "Others"):
                 downloaded_paths.append(match.group(1).strip())
 
     returncode = await process.wait()
+    active_downloads.pop(cancel_id, None)
 
     if downloaded_paths:
         final_path = downloaded_paths[-1]
+
+    if tracker.is_cancelled:
+        await cleanup_temp(final_path)
+        await cleanup_temp(final_path + ".aria2")
+        return None
 
     if returncode != 0:
         await cleanup_temp(final_path)
@@ -325,9 +345,9 @@ def _build_ydl_opts(fmt: str, tracker: ProgressTracker, category: str) -> dict:
     return opts
 
 
-async def download_video(url: str, fmt: str, status_msg, loop, category: str) -> str | None:
+async def download_video(url: str, fmt: str, status_msg, loop, cancel_id: str, category: str) -> str | None:
     """Download a video/audio via yt-dlp; returns the final filepath or None."""
-    tracker = ProgressTracker(status_msg, loop)
+    tracker = ProgressTracker(status_msg, loop, cancel_id)
     opts = _build_ydl_opts(fmt, tracker, category)
 
     def run():
@@ -344,8 +364,15 @@ async def download_video(url: str, fmt: str, status_msg, loop, category: str) ->
                 prepared = os.path.splitext(prepared)[0] + ".mp3"
             return prepared
 
-    filepath = await loop.run_in_executor(None, run)
-    return filepath
+    try:
+        filepath = await loop.run_in_executor(None, run)
+        return filepath
+    except Exception as e:
+        if tracker.is_cancelled:
+            return None
+        raise
+    finally:
+        active_downloads.pop(cancel_id, None)
 
 
 # --- INLINE KEYBOARD ---
@@ -459,6 +486,22 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         pending_downloads.pop(user_id, None)
         return
 
+    if data.startswith("cancel_"):
+        cancel_id = data.split("_")[1]
+        tracker = active_downloads.get(cancel_id)
+        if tracker:
+            tracker.is_cancelled = True
+            if tracker.aria2_process:
+                try:
+                    tracker.aria2_process.terminate()
+                except Exception:
+                    pass
+            active_downloads.pop(cancel_id, None)
+            await query.edit_message_text("❌ Download cancelled.")
+        else:
+            await query.answer("Download already finished or not found!")
+        return
+
     state = pending_downloads.get(user_id)
     if not state:
         await query.edit_message_text("⚠️ No pending link. Send a new one.")
@@ -475,9 +518,11 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         if not is_video_site(url):
             pending_downloads.pop(user_id, None)
             status_msg = await query.edit_message_text(f"⏳ Starting direct download in {cat}…")
+            cancel_id = str(int(time.time() * 1000)) + str(user_id)
             try:
-                filepath = await download_direct(url, status_msg, loop, category=cat)
-                await _handle_successful_download(filepath, status_msg)
+                filepath = await download_direct(url, status_msg, loop, cancel_id, category=cat)
+                if filepath:
+                    await _handle_successful_download(filepath, status_msg)
             except Exception as e:
                 logger.error("Direct download error: %s", e, exc_info=True)
                 await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
@@ -500,10 +545,12 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         status_msg = await query.edit_message_text(
             f"⏳ Starting download… ({labels.get(fmt, fmt)} -> {cat})"
         )
+        cancel_id = str(int(time.time() * 1000)) + str(user_id)
 
         try:
-            filepath = await download_video(url, fmt, status_msg, loop, category=cat)
-            await _handle_successful_download(filepath, status_msg)
+            filepath = await download_video(url, fmt, status_msg, loop, cancel_id, category=cat)
+            if filepath:
+                await _handle_successful_download(filepath, status_msg)
         except Exception as e:
             logger.error("Download error: %s", e, exc_info=True)
             await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
